@@ -7,7 +7,9 @@ VENV_DIR="$SCRIPTDIR/venv"
 trac_env="$SCRIPTDIR/data"
 clear_env="${TRAC_CLEAR_ENV:-0}"
 
-trac_user=`id -n -u`
+plugin_dirs=("../trac-crashdump")
+extra_python_modules=("../arsoft-python/python2")
+
 
 function usage() {
 	echo "Usage: $SCRIPTNAME [OPTIONS]"
@@ -72,14 +74,48 @@ function trac_initenv() {
 }
 
 function trac_upgrade() {
+
+    #. "$VENV_DIR/bin/activate"
+
     local upgrade_ok=0
+    local trac_plugin_dir="$trac_env/plugins"
+
+    local python_path="$PYTHONPATH"
+    for p in $plugin_dirs; do
+        b=`basename "$p"`
+        if [ -L "$trac_plugin_dir/$b" -a -d "$trac_plugin_dir/$b" ]; then
+            echo "Plugin $b already symlinked"
+        else
+            local d=`readlink -f "$SCRIPTDIR/$p"`
+            ln -sf "$d" "$trac_plugin_dir/$b"
+        fi
+    done
+
+    for p in $extra_python_modules; do
+        local full=`readlink -f "$SCRIPTDIR/$p"`
+        [ -z "$python_path" ] && python_path="$full" || python_path="$python_path:$full"
+    done
+
+    for d in "$trac_env/plugins"/*; do
+        if [ -L "$d" ]; then
+            full=`readlink -f "$d"`
+            #echo "found2 $full"
+        else
+            full=`readlink -f "$d"`
+        fi
+        echo "$d -> $full"
+        if [ -d "$full" ]; then
+            [ -z "$python_path" ] && python_path="$full" || python_path="$python_path:$full"
+            true
+        fi
+    done
 
     # Only enable addons once
     if [ ! -f "$trac_env/addons_enabled" ]; then
         echo "done" > "$trac_env/addons_enabled"
 
         # allow anonymous to run admin page
-        trac-admin "$trac_env" permission add anonymous TRAC_ADMIN || upgrade_ok=1
+        PYTHONPATH="$python_path" trac-admin "$trac_env" permission add anonymous TRAC_ADMIN || upgrade_ok=1
 
         trac_ini "$trac_env/conf/trac.ini" "components" "announcer.*" "enabled"
         trac_ini "$trac_env/conf/trac.ini" "components" "customfieldadmin.*" "enabled"
@@ -93,16 +129,18 @@ function trac_upgrade() {
         trac_ini "$trac_env/conf/trac.ini" "components" "mastertickets.*" "enabled"
         trac_ini "$trac_env/conf/trac.ini" "components" "tracrpc.*" "enabled"
         trac_ini "$trac_env/conf/trac.ini" "components" "arsoft.trac.plugins.commitupdater.commit_updater.*" "enabled"
+
+        trac_ini "$trac_env/conf/trac.ini" "logging" "log_type" "file"
     fi
 
     if [ $upgrade_ok -eq 0 ]; then
-        trac-admin "$trac_env" upgrade || upgrade_ok=1
-        trac-admin "$trac_env" wiki upgrade || upgrade_ok=1
+        PYTHONPATH="$python_path" trac-admin "$trac_env" upgrade || upgrade_ok=1
+        PYTHONPATH="$python_path" trac-admin "$trac_env" wiki upgrade || upgrade_ok=1
     fi
 
     if [ $upgrade_ok -eq 0 ]; then
         test -d "$trac_env/tmp/deploy" && rm -rf "$trac_env/tmp/deploy"
-        trac-admin "$trac_env" deploy "$trac_env/tmp/deploy" || upgrade_ok=1
+        PYTHONPATH="$python_path" trac-admin "$trac_env" deploy "$trac_env/tmp/deploy" || upgrade_ok=1
         if [ -d "$trac_env/tmp/deploy/htdocs" ]; then
             cp -a "$trac_env/tmp/deploy/htdocs"/* "$trac_env/htdocs"
         else
@@ -117,6 +155,8 @@ function trac_upgrade() {
         echo "Failed to upgrade $trac_env"
     fi
 
+    #deactivate
+
     return $upgrade_ok
 }
 
@@ -124,13 +164,20 @@ function venv_run() {
     local plugins_dir="$trac_env/plugins"
     [ ! -d "$plugins_dir" ] && mkdir "$plugins_dir"
 
-    . "$VENV_DIR/bin/activate"
+    if [ $clear_env -ne 0 ]; then
+        echo "Clear environment $trac_env"
+        find "$trac_env" -delete
+    fi
+
+    if [ ! -f "$trac_env/VERSION" ]; then
+        upgrade=1
+        trac_initenv || exit $?
+    fi
 
     local python_path="$PYTHONPATH"
     for d in "$trac_env/plugins"/*; do
         if [ -L "$d" ]; then
             full=`readlink -f "$d"`
-            full=`dirname "$full"`
         else
             full=`readlink -f "$d"`
         fi
@@ -139,6 +186,11 @@ function venv_run() {
             [ -z "$python_path" ] && python_path="$full" || python_path="$python_path:$full"
             true
         fi
+    done
+
+    for p in $extra_python_modules; do
+        local full=`readlink -f "$SCRIPTDIR/$p"`
+        [ -z "$python_path" ] && python_path="$full" || python_path="$python_path:$full"
     done
 
     if [ $upgrade -ne 0 ]; then
@@ -150,7 +202,7 @@ function venv_run() {
     fi
 
     if [ $venv_gunicorn -ne 0 ]; then
-        venv_run_gunicorn
+        PYTHONPATH="$python_path" venv_run_gunicorn
         RES=$?
     elif [ $admin -ne 0 ]; then
         PYTHONPATH="$python_path" trac-admin "$trac_env" $admin_args
@@ -159,10 +211,9 @@ function venv_run() {
         echo "PYTHONPATH=$python_path tracd --port 8000 $trac_env"
         # user: user, pw: pass
         echo "user:\$apr1\$80wqi5pg\$.FmE/RV1Q/WcY9LUlACLW0" > $trac_env/password_file
-        PYTHONPATH="$python_path" tracd --port 8000 -s --basic-auth="*,$trac_env/password_file,My Realm" "$trac_env"
+        PYTHONPATH="$python_path" $VENV_DIR/bin/tracd --port 8000 -s --basic-auth="*,$trac_env/password_file,My Realm" "$trac_env"
         RES=$?
     fi
-    deactivate
 }
 
 verbose=0
@@ -215,15 +266,6 @@ if [ $venv_initialize -ne 0 ]; then
     exit $RES
 fi
 
-if [ $clear_env -ne 0 ]; then
-    echo "Clear environment $trac_env"
-    #find "$trac_env" -delete
-fi
-
-if [ ! -f "$trac_env/VERSION" ]; then
-    trac_initenv || exit $?
-fi
-
 # check if the script is installed and a copy of python can be found beside it
 if [ -x "$SCRIPTDIR/python" ]; then
     venv_run_installed=1
@@ -246,7 +288,7 @@ else
         source "$VENV_DIR/bin/activate"
         RES=$?
     else
-        venv_run
+        PATH="$VENV_DIR/bin:$PATH" venv_run
         RES=$?
     fi
     exit $RES
