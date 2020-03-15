@@ -1,0 +1,254 @@
+#!/bin/bash
+SCRIPTFILE=`readlink -f "$0"`
+SCRIPTNAME=`basename "$SCRIPTFILE"`
+SCRIPTDIR=`dirname "$SCRIPTFILE"`
+
+VENV_DIR="$SCRIPTDIR/venv"
+trac_env="$SCRIPTDIR/data"
+clear_env="${TRAC_CLEAR_ENV:-0}"
+
+trac_user=`id -n -u`
+
+function usage() {
+	echo "Usage: $SCRIPTNAME [OPTIONS]"
+	echo "  run/create/initializes the trac"
+	echo "OPTIONS:"
+	echo "    -h, --help            shows this help"
+	echo "    -v, --verbose         enable verbose output"
+	echo "    -u, --upgrade         upgrade the trac environment before run"
+	echo "    --upgrade-only        only run upgrade, but do not start trac itself."
+	echo "    -a, --admin           start trac-admin tool"
+	echo "    --env <dir>           use different trac environment (default: $trac_env)"
+	echo "    --init                initialize the virtualenv for trac"
+	echo "    --gunicorn            run within gunicorn WSGI server"
+	exit 0
+}
+
+function do_initialize_venv() {
+    msg=`python2 -m virtualenv "$VENV_DIR" 2>&1`
+    if [ -f "$VENV_DIR/bin/activate" ]; then
+        source "$VENV_DIR/bin/activate"
+        pip install -r "$SCRIPTDIR/requirements.txt"
+        deactivate
+    else
+        echo "Unable to create virtual environment $VENV_DIR. Please run 'sudo apt install python-virtualenv'." >&2
+        false
+    fi
+}
+
+function venv_run_gunicorn() {
+    local FLASK_SERVER_PORT=8000
+    local opts=''
+    opts="$opts --chdir $SCRIPTDIR"
+    if [ -f "$SCRIPTDIR/server_cert.pem" -a -f "$SCRIPTDIR/server_key.pem" ]; then
+        opts="$opts --certfile=$SCRIPTDIR/server_cert.pem --keyfile=$SCRIPTDIR/server_key.pem"
+    fi
+    opts="$opts --bind 0.0.0.0:$FLASK_SERVER_PORT"
+    if [ $verbose -ne 0 ]; then
+        opts="$opts --log-level debug"
+    fi
+    gunicorn $opts app:app
+    RES=$?
+}
+
+function trac_ini() {
+    python "$SCRIPTDIR/trac-ini" $@
+}
+
+
+function trac_initenv() {
+    local init_args="example sqlite:db/trac.db"
+    local init_ok=0
+    [ ! -d "$trac_env" ] && mkdir "$trac_env"
+    #chown "$trac_user:nogroup" -R "$trac_env" || init_ok=1
+    trac-admin "$trac_env" initenv $init_args || init_ok=1
+
+    if [ $init_ok -eq 0 ]; then
+        echo "Initialize of $trac_env complete"
+    else
+        echo "Failed to initialize $trac_env"
+    fi
+    return $init_ok
+}
+
+function trac_upgrade() {
+    local upgrade_ok=0
+
+    # Only enable addons once
+    if [ ! -f "$trac_env/addons_enabled" ]; then
+        echo "done" > "$trac_env/addons_enabled"
+
+        # allow anonymous to run admin page
+        trac-admin "$trac_env" permission add anonymous TRAC_ADMIN || upgrade_ok=1
+
+        trac_ini "$trac_env/conf/trac.ini" "components" "announcer.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "customfieldadmin.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "tracworkflowadmin.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "clients.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "HudsonTrac.HudsonTracPlugin.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "timingandestimationplugin.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "advancedworkflow.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "crashdump.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "iniadmin.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "mastertickets.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "tracrpc.*" "enabled"
+        trac_ini "$trac_env/conf/trac.ini" "components" "arsoft.trac.plugins.commitupdater.commit_updater.*" "enabled"
+    fi
+
+    if [ $upgrade_ok -eq 0 ]; then
+        trac-admin "$trac_env" upgrade || upgrade_ok=1
+        trac-admin "$trac_env" wiki upgrade || upgrade_ok=1
+    fi
+
+    if [ $upgrade_ok -eq 0 ]; then
+        test -d "$trac_env/tmp/deploy" && rm -rf "$trac_env/tmp/deploy"
+        trac-admin "$trac_env" deploy "$trac_env/tmp/deploy" || upgrade_ok=1
+        if [ -d "$trac_env/tmp/deploy/htdocs" ]; then
+            cp -a "$trac_env/tmp/deploy/htdocs"/* "$trac_env/htdocs"
+        else
+            echo "Deploy of $trac_env failed"
+        fi
+        test -d "$trac_env/tmp/deploy" && rm -rf "$trac_env/tmp/deploy"
+    fi
+
+    if [ $upgrade_ok -eq 0 ]; then
+        echo "Upgrade of $trac_env complete"
+    else
+        echo "Failed to upgrade $trac_env"
+    fi
+
+    return $upgrade_ok
+}
+
+function venv_run() {
+    local plugins_dir="$trac_env/plugins"
+    [ ! -d "$plugins_dir" ] && mkdir "$plugins_dir"
+
+    . "$VENV_DIR/bin/activate"
+
+    local python_path="$PYTHONPATH"
+    for d in "$trac_env/plugins"/*; do
+        if [ -L "$d" ]; then
+            full=`readlink -f "$d"`
+            full=`dirname "$full"`
+        else
+            full=`readlink -f "$d"`
+        fi
+        echo "$d -> $full"
+        if [ -d "$full" ]; then
+            [ -z "$python_path" ] && python_path="$full" || python_path="$python_path:$full"
+            true
+        fi
+    done
+
+    if [ $upgrade -ne 0 ]; then
+        trac_upgrade
+        if [ $upgrade_only -ne 0 ]; then
+            deactivate
+            return
+        fi
+    fi
+
+    if [ $venv_gunicorn -ne 0 ]; then
+        venv_run_gunicorn
+        RES=$?
+    elif [ $admin -ne 0 ]; then
+        PYTHONPATH="$python_path" trac-admin "$trac_env" $admin_args
+    else
+        echo "NOTE: if a plugin does not show up: run \"./setup.py bdist\" within the plugin source dir."
+        echo "PYTHONPATH=$python_path tracd --port 8000 $trac_env"
+        # user: user, pw: pass
+        echo "user:\$apr1\$80wqi5pg\$.FmE/RV1Q/WcY9LUlACLW0" > $trac_env/password_file
+        PYTHONPATH="$python_path" tracd --port 8000 -s --basic-auth="*,$trac_env/password_file,My Realm" "$trac_env"
+        RES=$?
+    fi
+    deactivate
+}
+
+verbose=0
+upgrade=0
+upgrade_only=0
+admin=0
+admin_args=''
+venv_initialize=0
+venv_gunicorn=0
+venv_activate=0
+
+# parse command line arguments
+while [ $# -ne 0 ]; do
+	case "$1" in
+	'-?'|'-h'|'--help') usage;;
+	'-v'|'--verbose') verbose=1; set -x; ;;
+	'-u'|'--upgrade') upgrade=1; ;;
+	'--upgrade-only') upgrade=1; upgrade_only=1; ;;
+	'-a'|'--admin') admin=1; ;;
+	'-e'|'--env')
+        shift;
+        trac_env="$1";
+        ;;
+	'--init') venv_initialize=1; ;;
+	'--gunicorn') venv_gunicorn=1; ;;
+	'--activate') venv_activate=1; ;;
+	-*)
+		echo "Unrecognized option $1" >&2
+		exit 1
+		;;
+	*)
+        if [ $admin -ne 0 ]; then
+            if [ -z "$admin_args" ]; then
+                admin_args="$1"
+            else
+                admin_args="$admin_args $1"
+            fi
+        else
+            echo "Unrecognized argument $1" >&2
+            exit 1
+        fi
+		;;
+	esac
+	shift
+done
+
+if [ $venv_initialize -ne 0 ]; then
+    do_initialize_venv
+    RES=$?
+    exit $RES
+fi
+
+if [ $clear_env -ne 0 ]; then
+    echo "Clear environment $trac_env"
+    #find "$trac_env" -delete
+fi
+
+if [ ! -f "$trac_env/VERSION" ]; then
+    trac_initenv || exit $?
+fi
+
+# check if the script is installed and a copy of python can be found beside it
+if [ -x "$SCRIPTDIR/python" ]; then
+    venv_run_installed=1
+    scriptdirname=`basename "$SCRIPTDIR"`
+    if [ "$scriptdirname" == 'bin' ]; then
+        VENV_DIR=`readlink -f "$SCRIPTDIR/.."`
+    else
+        VENV_DIR="$SCRIPTDIR"
+    fi
+    PATH="$VENV_DIR/bin:$PATH" venv_run_gunicorn
+    exit $RES
+elif [ ! -d "$VENV_DIR" ]; then
+    echo "No virtualenv directory $VENV_DIR found. Run '$SCRIPTFILE --init'" >&2
+    exit 2
+elif [ ! -f "$VENV_DIR/bin/activate" ]; then
+    echo "No virtualenv directory $VENV_DIR not initialized. Run '$SCRIPTFILE --init'" >&2
+    exit 2
+else
+    if [ $venv_activate -ne 0 ]; then
+        source "$VENV_DIR/bin/activate"
+        RES=$?
+    else
+        venv_run
+        RES=$?
+    fi
+    exit $RES
+fi
+
