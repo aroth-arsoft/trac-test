@@ -6,6 +6,7 @@ SCRIPTDIR=`dirname "$SCRIPTFILE"`
 VENV_DIR="$SCRIPTDIR/venv"
 trac_env="$SCRIPTDIR/data"
 clear_env="${TRAC_CLEAR_ENV:-0}"
+trac_version=''
 
 plugin_dirs=("../trac-crashdump")
 extra_python_modules=("../arsoft-python/python2")
@@ -21,6 +22,7 @@ function usage() {
 	echo "    --upgrade-only        only run upgrade, but do not start trac itself."
 	echo "    -a, --admin           start trac-admin tool"
 	echo "    --env <dir>           use different trac environment (default: $trac_env)"
+	echo "    --version <maj.min>   specify trac version"
 	echo "    --init                initialize the virtualenv for trac"
 	echo "    --gunicorn            run within gunicorn WSGI server"
 	exit 0
@@ -30,7 +32,15 @@ function do_initialize_venv() {
     msg=`python2 -m virtualenv "$VENV_DIR" 2>&1`
     if [ -f "$VENV_DIR/bin/activate" ]; then
         source "$VENV_DIR/bin/activate"
-        pip install -r "$SCRIPTDIR/requirements.txt"
+        local req_txt=`mktemp`
+        if [ ! -z "$trac_version" ]; then
+            cat "$SCRIPTDIR/requirements.txt" | sed "s/^Trac.*/Trac==${trac_version}.*/" > "$req_txt"
+        else
+            cat "$SCRIPTDIR/requirements.txt" > "$req_txt"
+        fi
+        cat "$req_txt"
+        pip install -r "$req_txt"
+        rm "$req_txt"
         deactivate
     else
         echo "Unable to create virtual environment $VENV_DIR. Please run 'sudo apt install python-virtualenv'." >&2
@@ -161,8 +171,8 @@ function trac_upgrade() {
 }
 
 function venv_run() {
-    local plugins_dir="$trac_env/plugins"
-    [ ! -d "$plugins_dir" ] && mkdir "$plugins_dir"
+
+    [ ! -d "$trac_env" ] && mkdir "$trac_env"
 
     if [ $clear_env -ne 0 ]; then
         echo "Clear environment $trac_env"
@@ -174,8 +184,12 @@ function venv_run() {
         trac_initenv || exit $?
     fi
 
+
+    local plugins_dir="$trac_env/plugins"
+    [ ! -d "$plugins_dir" ] && mkdir "$plugins_dir"
+
     local python_path="$PYTHONPATH"
-    for d in "$trac_env/plugins"/*; do
+    for d in "$plugins_dir"/*; do
         if [ -L "$d" ]; then
             full=`readlink -f "$d"`
         else
@@ -237,6 +251,10 @@ while [ $# -ne 0 ]; do
         shift;
         trac_env="$1";
         ;;
+	'--version')
+        shift;
+        trac_version="$1";
+        ;;
 	'--init') venv_initialize=1; ;;
 	'--gunicorn') venv_gunicorn=1; ;;
 	'--activate') venv_activate=1; ;;
@@ -266,6 +284,11 @@ if [ $venv_initialize -ne 0 ]; then
     exit $RES
 fi
 
+if [ ! -z "$trac_version" ]; then
+    trac_env="${trac_env}_${trac_version}"
+    VENV_DIR="${VENV_DIR}_${trac_version}"
+fi
+
 # check if the script is installed and a copy of python can be found beside it
 if [ -x "$SCRIPTDIR/python" ]; then
     venv_run_installed=1
@@ -277,13 +300,11 @@ if [ -x "$SCRIPTDIR/python" ]; then
     fi
     PATH="$VENV_DIR/bin:$PATH" venv_run_gunicorn
     exit $RES
-elif [ ! -d "$VENV_DIR" ]; then
-    echo "No virtualenv directory $VENV_DIR found. Run '$SCRIPTFILE --init'" >&2
-    exit 2
-elif [ ! -f "$VENV_DIR/bin/activate" ]; then
-    echo "No virtualenv directory $VENV_DIR not initialized. Run '$SCRIPTFILE --init'" >&2
-    exit 2
 else
+    if [ ! -d "$VENV_DIR" -o ! -f "$VENV_DIR/bin/activate" ]; then
+        echo "Initialize virtual environment in $VENV_DIR"
+        do_initialize_venv || exit 1
+    fi
     if [ $venv_activate -ne 0 ]; then
         source "$VENV_DIR/bin/activate"
         RES=$?
